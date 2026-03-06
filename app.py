@@ -1,112 +1,195 @@
-import os
-import json
-import tldextract
-from urllib.parse import urlparse
-
 from flask import Flask, request, Response
 from playwright.sync_api import sync_playwright
+from urllib.parse import urlparse
+import os
+import threading
+import json
 
 app = Flask(__name__)
 
 COOKIE_DIR = "cookies"
 os.makedirs(COOKIE_DIR, exist_ok=True)
 
+browser = None
+playwright = None
+browser_lock = threading.Lock()
 
-def get_main_domain(url):
-    ext = tldextract.extract(url)
-    return f"{ext.domain}.{ext.suffix}"
+domain_states = {}
+domain_locks = {}
+
+
+def get_domain(url):
+    return urlparse(url).hostname
 
 
 def cookie_path(domain):
-    return os.path.join(COOKIE_DIR, f"{domain}.json")
+    return f"{COOKIE_DIR}/{domain}.json"
 
 
-def load_cookies(domain):
+def get_domain_lock(domain):
+    if domain not in domain_locks:
+        domain_locks[domain] = threading.Lock()
+    return domain_locks[domain]
+
+
+def load_cookie_state(domain):
+
     path = cookie_path(domain)
+
     if os.path.exists(path):
         with open(path, "r") as f:
             return json.load(f)
+
     return None
 
 
-def save_cookies(domain, cookies):
-    with open(cookie_path(domain), "w") as f:
-        json.dump(cookies, f)
+def save_cookie_state(domain, context):
+
+    path = cookie_path(domain)
+
+    context.storage_state(path=path)
+
+    with open(path) as f:
+        domain_states[domain] = json.load(f)
+
+
+def solve_cloudflare(domain):
+
+    print(f"[CF] solving challenge for {domain}")
+
+    context = browser.new_context()
+
+    page = context.new_page()
+
+    page.goto(
+        f"https://{domain}",
+        wait_until="domcontentloaded",
+        timeout=30000
+    )
+
+    save_cookie_state(domain, context)
+
+    context.close()
+
+    print(f"[CF] cookies saved for {domain}")
+
+
+def fetch(url):
+
+    domain = get_domain(url)
+
+    lock = get_domain_lock(domain)
+
+    with lock:
+
+        state = domain_states.get(domain)
+
+        if state is None:
+            state = load_cookie_state(domain)
+
+            if state:
+                domain_states[domain] = state
+
+    context_args = {}
+
+    if state:
+        print(f"[COOKIE] using cached cookies for {domain}")
+        context_args["storage_state"] = state
+    else:
+        print(f"[COOKIE] no cookies for {domain}")
+
+    context = browser.new_context(**context_args)
+
+    page = context.new_page()
+
+    response = page.request.get(
+        url,
+        headers={
+            "Referer": f"https://{domain}/",
+            "Origin": f"https://{domain}"
+        },
+        timeout=20000
+    )
+
+    status = response.status
+    body = response.body()
+    headers = response.headers
+
+    context.close()
+
+    if status in [403, 503]:
+
+        print(f"[BLOCKED] refreshing cookies for {domain}")
+
+        with lock:
+
+            solve_cloudflare(domain)
+
+        return fetch(url)
+
+    return status, body, headers
 
 
 @app.route("/")
 def home():
-    return "Playwright Proxy"
+    return """
+    <h2>Ultra Fast Playwright Image Proxy</h2>
+    <pre>/proxy?url=IMAGE_URL</pre>
+    """
 
 
 @app.route("/proxy")
 def proxy():
 
     url = request.args.get("url")
-    if not url:
-        return "Missing url parameter", 400
 
-    domain = get_main_domain(url)
-    parsed = urlparse(url)
-    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    if not url:
+        return "Missing url", 400
 
     try:
-        with sync_playwright() as p:
 
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                ],
-            )
+        status, body, headers = fetch(url)
 
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
-            )
+        content_type = headers.get("content-type", "image/webp")
 
-            cookies = load_cookies(domain)
-
-            if cookies:
-                print(f"[COOKIE] Using cached cookies for {domain}")
-                context.add_cookies(cookies)
-            else:
-                print(f"[COOKIE] No cookies for {domain}")
-
-            page = context.new_page()
-
-            # Open site root (Cloudflare check happens here)
-            page.goto(base_url, wait_until="domcontentloaded", timeout=20000)
-
-            # Fetch image
-            response = page.request.get(
-                url,
-                headers={
-                    "Referer": base_url,
-                    "Origin": base_url,
-                },
-                timeout=20000
-            )
-
-            # If Cloudflare triggered, update cookies
-            new_cookies = context.cookies()
-
-            if new_cookies:
-                save_cookies(domain, new_cookies)
-                print(f"[COOKIE] Updated cookies for {domain}")
-
-            body = response.body()
-            status = response.status
-            content_type = response.headers.get("content-type", "image/webp")
-
-            browser.close()
-
-            return Response(body, status=status, content_type=content_type)
+        return Response(body, status=status, content_type=content_type)
 
     except Exception as e:
+
+        print("ERROR:", e)
+
         return str(e), 500
 
 
+def start_browser():
+
+    global playwright, browser
+
+    playwright = sync_playwright().start()
+
+    browser = playwright.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-blink-features=AutomationControlled"
+        ]
+    )
+
+    print("Playwright browser started")
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+
+    start_browser()
+
+    print("Server running on http://0.0.0.0:5000")
+
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        threaded=True,
+        debug=False,
+        use_reloader=False
+    )
