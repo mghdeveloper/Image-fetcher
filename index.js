@@ -1,126 +1,85 @@
-import express from "express";
-import { chromium } from "playwright";
+from flask import Flask, request, Response
+from playwright.sync_api import sync_playwright
 
-const app = express();
-const PORT = process.env.PORT || 10000;
+app = Flask(__name__)
 
-let browser;
-let context;
-let page;
 
-let lastLoadTime = 0;
-let lockPromise = null;
+@app.route("/")
+def home():
+    return """
+    <html>
+    <body>
+        <h2>Playwright Headless Proxy</h2>
+        <p>Usage:</p>
+        <pre>/proxy?url=IMAGE_URL</pre>
+    </body>
+    </html>
+    """
 
-const TOKEN_TTL = 10 * 60 * 1000;
 
-/* =========================
-   INIT BROWSER
-========================= */
+@app.route("/proxy")
+def proxy():
+    url = request.args.get("url")
 
-async function initBrowser() {
-  if (browser) return;
+    if not url:
+        return "Missing url parameter", 400
 
-  console.log("Launching Chromium...");
+    try:
+        with sync_playwright() as p:
 
-  browser = await chromium.launch({
-    headless: true,
-    executablePath: chromium.executablePath(),
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--single-process"
-    ]
-  });
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                ]
+            )
 
-  context = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
-  });
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+                locale="en-US"
+            )
 
-  page = await context.newPage();
+            page = context.new_page()
 
-  browser.on("disconnected", () => {
-    console.log("Browser crashed. Resetting...");
-    browser = null;
-    context = null;
-    page = null;
-  });
-}
+            # Visit main site to simulate real browser
+            page.goto(
+                "https://comix.to/",
+                wait_until="domcontentloaded",
+                timeout=15000
+            )
 
-/* =========================
-   FETCH IMAGE DIRECT
-========================= */
+            response = page.request.get(
+                url,
+                headers={
+                    "Referer": "https://comix.to/",
+                    "Origin": "https://comix.to"
+                },
+                timeout=15000
+            )
 
-async function fetchImage(url) {
-  if (lockPromise) await lockPromise;
+            body = response.body()
+            status = response.status
+            content_type = response.headers.get("content-type", "image/webp")
 
-  lockPromise = (async () => {
-    await initBrowser();
+            browser.close()
 
-    console.log("Loading image:", url);
+            return Response(body, status=status, content_type=content_type)
 
-    const response = await page.goto(url, {
-      waitUntil: "commit",
-      timeout: 45000
-    });
+    except Exception as e:
+        return str(e), 500
 
-    lastLoadTime = Date.now();
 
-    if (!response) throw new Error("No response");
+if __name__ == "__main__":
+    print("Server running on http://localhost:5000")
 
-    const status = response.status();
-
-    if (status !== 200) {
-      console.log("Blocked with status:", status);
-      throw new Error("Blocked");
-    }
-
-    const buffer = await response.body();
-
-    return {
-      data: buffer,
-      type: response.headers()["content-type"]
-    };
-  })();
-
-  const result = await lockPromise;
-  lockPromise = null;
-
-  return result;
-}
-
-/* =========================
-   ROUTES
-========================= */
-
-app.get("/health", (req, res) => {
-  res.send("OK");
-});
-
-app.get("/fetch", async (req, res) => {
-  const { url } = req.query;
-
-  if (!url) {
-    return res.status(400).send("Missing url parameter");
-  }
-
-  try {
-    const result = await fetchImage(url);
-
-    res.set("Content-Type", result.type || "image/jpeg");
-    res.send(result.data);
-  } catch (err) {
-    console.error(err.message);
-    res.status(500).send("Failed to fetch image");
-  }
-});
-
-/* =========================
-   START SERVER
-========================= */
-
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        debug=False,
+        threaded=False,
+        use_reloader=False
+    )
