@@ -1,8 +1,8 @@
 from flask import Flask, request, Response
 from playwright.sync_api import sync_playwright
 from urllib.parse import urlparse
-import os
 import threading
+import os
 import json
 
 app = Flask(__name__)
@@ -16,6 +16,34 @@ browser_lock = threading.Lock()
 
 domain_states = {}
 domain_locks = {}
+
+
+def get_browser():
+    global browser, playwright
+
+    if browser is None:
+
+        with browser_lock:
+
+            if browser is None:
+
+                print("[INIT] Starting Playwright browser...")
+
+                playwright = sync_playwright().start()
+
+                browser = playwright.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--disable-blink-features=AutomationControlled"
+                    ]
+                )
+
+                print("[INIT] Browser started")
+
+    return browser
 
 
 def get_domain(url):
@@ -37,8 +65,13 @@ def load_cookie_state(domain):
     path = cookie_path(domain)
 
     if os.path.exists(path):
-        with open(path, "r") as f:
-            return json.load(f)
+        try:
+            with open(path, "r") as f:
+                state = json.load(f)
+                domain_states[domain] = state
+                return state
+        except:
+            pass
 
     return None
 
@@ -49,77 +82,91 @@ def save_cookie_state(domain, context):
 
     context.storage_state(path=path)
 
-    with open(path) as f:
-        domain_states[domain] = json.load(f)
+    try:
+        with open(path, "r") as f:
+            domain_states[domain] = json.load(f)
+    except:
+        pass
 
 
 def solve_cloudflare(domain):
 
-    print(f"[CF] solving challenge for {domain}")
+    print(f"[CF] Solving Cloudflare for {domain}")
+
+    browser = get_browser()
 
     context = browser.new_context()
 
     page = context.new_page()
 
-    page.goto(
-        f"https://{domain}",
-        wait_until="domcontentloaded",
-        timeout=30000
-    )
+    try:
 
-    save_cookie_state(domain, context)
+        page.goto(
+            f"https://{domain}",
+            wait_until="domcontentloaded",
+            timeout=30000
+        )
 
-    context.close()
+        save_cookie_state(domain, context)
 
-    print(f"[CF] cookies saved for {domain}")
+        print(f"[CF] Cookies saved for {domain}")
+
+    except Exception as e:
+
+        print("[CF] Error:", e)
+
+    finally:
+
+        context.close()
 
 
 def fetch(url):
 
     domain = get_domain(url)
 
+    browser = get_browser()
+
     lock = get_domain_lock(domain)
 
-    with lock:
+    state = domain_states.get(domain)
 
-        state = domain_states.get(domain)
-
-        if state is None:
-            state = load_cookie_state(domain)
-
-            if state:
-                domain_states[domain] = state
+    if state is None:
+        state = load_cookie_state(domain)
 
     context_args = {}
 
     if state:
-        print(f"[COOKIE] using cached cookies for {domain}")
+        print(f"[COOKIE] Using cached cookies for {domain}")
         context_args["storage_state"] = state
     else:
-        print(f"[COOKIE] no cookies for {domain}")
+        print(f"[COOKIE] No cookies for {domain}")
 
     context = browser.new_context(**context_args)
 
     page = context.new_page()
 
-    response = page.request.get(
-        url,
-        headers={
-            "Referer": f"https://{domain}/",
-            "Origin": f"https://{domain}"
-        },
-        timeout=20000
-    )
+    try:
 
-    status = response.status
-    body = response.body()
-    headers = response.headers
+        response = page.request.get(
+            url,
+            headers={
+                "Referer": f"https://{domain}/",
+                "Origin": f"https://{domain}"
+            },
+            timeout=20000
+        )
 
-    context.close()
+        status = response.status
+        body = response.body()
+        headers = response.headers
+
+    finally:
+
+        context.close()
 
     if status in [403, 503]:
 
-        print(f"[BLOCKED] refreshing cookies for {domain}")
+        print(f"[BLOCKED] Cloudflare triggered for {domain}")
 
         with lock:
 
@@ -133,8 +180,13 @@ def fetch(url):
 @app.route("/")
 def home():
     return """
-    <h2>Ultra Fast Playwright Image Proxy</h2>
-    <pre>/proxy?url=IMAGE_URL</pre>
+    <html>
+    <body>
+        <h2>Playwright Cloudflare Image Proxy</h2>
+        <p>Usage:</p>
+        <pre>/proxy?url=IMAGE_URL</pre>
+    </body>
+    </html>
     """
 
 
@@ -144,7 +196,7 @@ def proxy():
     url = request.args.get("url")
 
     if not url:
-        return "Missing url", 400
+        return "Missing url parameter", 400
 
     try:
 
@@ -156,33 +208,12 @@ def proxy():
 
     except Exception as e:
 
-        print("ERROR:", e)
+        print("[ERROR]", e)
 
         return str(e), 500
 
 
-def start_browser():
-
-    global playwright, browser
-
-    playwright = sync_playwright().start()
-
-    browser = playwright.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--disable-blink-features=AutomationControlled"
-        ]
-    )
-
-    print("Playwright browser started")
-
-
 if __name__ == "__main__":
-
-    start_browser()
 
     print("Server running on http://0.0.0.0:5000")
 
