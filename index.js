@@ -8,8 +8,8 @@ let browser;
 let context;
 let page;
 
-let lastTokenTime = 0;
-let refreshPromise = null;
+let lastLoadTime = 0;
+let lockPromise = null;
 
 const TOKEN_TTL = 10 * 60 * 1000;
 
@@ -36,8 +36,7 @@ async function initBrowser() {
 
   context = await browser.newContext({
     userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-    viewport: { width: 1280, height: 800 }
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
   });
 
   page = await context.newPage();
@@ -51,69 +50,45 @@ async function initBrowser() {
 }
 
 /* =========================
-   SOLVE CLOUDFLARE
-========================= */
-
-async function solveCloudflare(url) {
-  if (refreshPromise) return refreshPromise;
-
-  refreshPromise = (async () => {
-    await initBrowser();
-
-    const domain = new URL(url).origin;
-
-    console.log("Solving Cloudflare:", domain);
-
-    await page.goto(domain, {
-      waitUntil: "domcontentloaded",
-      timeout: 45000
-    });
-
-    await page.waitForTimeout(7000);
-
-    lastTokenTime = Date.now();
-
-    console.log("Cloudflare solved");
-  })();
-
-  await refreshPromise;
-  refreshPromise = null;
-}
-
-/* =========================
-   FETCH IMAGE (BROWSER)
+   FETCH IMAGE DIRECT
 ========================= */
 
 async function fetchImage(url) {
-  if (!browser || Date.now() - lastTokenTime > TOKEN_TTL) {
-    await solveCloudflare(url);
-  }
+  if (lockPromise) await lockPromise;
 
-  try {
-    const response = await page.request.get(url);
+  lockPromise = (async () => {
+    await initBrowser();
 
-    if (response.status() === 200) {
-      const buffer = await response.body();
-      return {
-        data: buffer,
-        type: response.headers()["content-type"]
-      };
+    console.log("Loading image:", url);
+
+    const response = await page.goto(url, {
+      waitUntil: "commit",
+      timeout: 45000
+    });
+
+    lastLoadTime = Date.now();
+
+    if (!response) throw new Error("No response");
+
+    const status = response.status();
+
+    if (status !== 200) {
+      console.log("Blocked with status:", status);
+      throw new Error("Blocked");
     }
 
-    console.log("Blocked. Re-solving Cloudflare...");
-
-    await solveCloudflare(url);
-
-    const retry = await page.request.get(url);
+    const buffer = await response.body();
 
     return {
-      data: await retry.body(),
-      type: retry.headers()["content-type"]
+      data: buffer,
+      type: response.headers()["content-type"]
     };
-  } catch (err) {
-    console.error("Image fetch failed:", err.message);
-    throw err;
-  }
+  })();
+
+  const result = await lockPromise;
+  lockPromise = null;
+
+  return result;
 }
 
 /* =========================
@@ -136,8 +111,9 @@ app.get("/fetch", async (req, res) => {
 
     res.set("Content-Type", result.type || "image/jpeg");
     res.send(result.data);
-  } catch {
-    res.status(500).send("Failed to fetch resource");
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send("Failed to fetch image");
   }
 });
 
