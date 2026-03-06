@@ -1,6 +1,7 @@
 from flask import Flask, request, Response
 from playwright.sync_api import sync_playwright
 import requests
+import threading
 
 app = Flask(__name__)
 
@@ -11,11 +12,16 @@ context = None
 cookies = {}
 headers = {}
 session = requests.Session()
+lock = threading.Lock()  # Ensure thread-safe browser init
 
 
 def start_browser():
-    """Start Playwright and initialize a browser context."""
-    global playwright, browser, context
+    """Start Playwright browser and context."""
+    global playwright, browser, context, cookies, headers
+
+    if context is not None:
+        # Already started
+        return
 
     print("🔹 Starting Playwright browser...")
 
@@ -45,19 +51,17 @@ def refresh_session():
     global cookies, headers, context
 
     if context is None:
-        print("⚠️ Browser context is None, cannot refresh session")
+        print("⚠️ Browser context not initialized")
         return
 
     print("🔄 Refreshing session via Playwright...")
-
     page = context.new_page()
     page.goto("https://comix.to/", wait_until="domcontentloaded")
 
-    # Collect cookies
+    # Get cookies and headers
     cookies_list = context.cookies()
     cookies = {c["name"]: c["value"] for c in cookies_list}
 
-    # Collect headers
     headers = {
         "User-Agent": page.evaluate("() => navigator.userAgent"),
         "Referer": "https://comix.to/",
@@ -69,7 +73,7 @@ def refresh_session():
 
 
 def fast_fetch(url):
-    """Try to fetch the image using requests + cached cookies/headers."""
+    """Try to fetch via HTTP using cached cookies and headers."""
     print(f"⚡ Fast request: {url}")
 
     try:
@@ -79,8 +83,8 @@ def fast_fetch(url):
             cookies=cookies,
             timeout=10
         )
-        print(f"HTTP status: {r.status_code}")
 
+        print(f"HTTP status: {r.status_code}")
         if r.status_code == 200:
             print("✅ Served via FAST HTTP request")
             return r
@@ -93,12 +97,6 @@ def fast_fetch(url):
         return None
 
 
-@app.before_first_request
-def init_browser():
-    """Initialize browser when the first request hits Flask (works with Gunicorn)."""
-    start_browser()
-
-
 @app.route("/")
 def home():
     return "Playwright + Fast HTTP Proxy is running"
@@ -106,6 +104,8 @@ def home():
 
 @app.route("/proxy")
 def proxy():
+    global context
+
     url = request.args.get("url")
     if not url:
         return "Missing url parameter", 400
@@ -113,7 +113,14 @@ def proxy():
     print("\n==============================")
     print("Incoming request:", url)
 
-    # 1️⃣ Try fast request
+    # Lazy browser initialization (thread-safe)
+    if context is None:
+        with lock:
+            if context is None:
+                print("⚠️ Browser not initialized, starting now...")
+                start_browser()
+
+    # 1️⃣ Try fast fetch first
     r = fast_fetch(url)
     if r:
         return Response(
@@ -122,7 +129,7 @@ def proxy():
             content_type=r.headers.get("content-type", "image/webp")
         )
 
-    # 2️⃣ Fallback to Playwright refresh
+    # 2️⃣ Fallback: refresh Playwright session and retry
     print("🧠 Falling back to Playwright")
     refresh_session()
 
@@ -138,7 +145,7 @@ def proxy():
     return "Failed", 500
 
 
-# Optional safety: allow running locally via python app.py
 if __name__ == "__main__":
+    # Local dev: start browser immediately
     start_browser()
     app.run(host="0.0.0.0", port=5000, threaded=True)
