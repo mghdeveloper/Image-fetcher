@@ -1,74 +1,54 @@
+import os
+import json
+import tldextract
+from urllib.parse import urlparse
+
 from flask import Flask, request, Response
 from playwright.sync_api import sync_playwright
-import threading
-import time
-import os
 
 app = Flask(__name__)
 
-COOKIE_FILE = "cookies.json"
-COOKIE_REFRESH_INTERVAL = 1800  # 30 minutes
+COOKIE_DIR = "cookies"
+os.makedirs(COOKIE_DIR, exist_ok=True)
 
 
-def refresh_cookies():
-    while True:
-        try:
-            with sync_playwright() as p:
+def get_main_domain(url):
+    ext = tldextract.extract(url)
+    return f"{ext.domain}.{ext.suffix}"
 
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-gpu",
-                        "--disable-blink-features=AutomationControlled",
-                    ]
-                )
 
-                context = browser.new_context()
+def cookie_path(domain):
+    return os.path.join(COOKIE_DIR, f"{domain}.json")
 
-                page = context.new_page()
 
-                print("Refreshing cookies...")
+def load_cookies(domain):
+    path = cookie_path(domain)
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return None
 
-                page.goto(
-                    "https://comix.to/",
-                    wait_until="domcontentloaded",
-                    timeout=15000
-                )
 
-                context.storage_state(path=COOKIE_FILE)
-
-                browser.close()
-
-                print("Cookies updated")
-
-        except Exception as e:
-            print("Cookie refresh error:", e)
-
-        time.sleep(COOKIE_REFRESH_INTERVAL)
+def save_cookies(domain, cookies):
+    with open(cookie_path(domain), "w") as f:
+        json.dump(cookies, f)
 
 
 @app.route("/")
 def home():
-    return """
-    <html>
-    <body>
-        <h2>Playwright Headless Proxy</h2>
-        <p>Usage:</p>
-        <pre>/proxy?url=IMAGE_URL</pre>
-    </body>
-    </html>
-    """
+    return "Playwright Proxy"
 
 
 @app.route("/proxy")
 def proxy():
 
     url = request.args.get("url")
-
     if not url:
         return "Missing url parameter", 400
+
+    domain = get_main_domain(url)
+    parsed = urlparse(url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
 
     try:
         with sync_playwright() as p:
@@ -79,24 +59,42 @@ def proxy():
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
-                ]
+                ],
             )
 
-            if os.path.exists(COOKIE_FILE):
-                context = browser.new_context(storage_state=COOKIE_FILE)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+            )
+
+            cookies = load_cookies(domain)
+
+            if cookies:
+                print(f"[COOKIE] Using cached cookies for {domain}")
+                context.add_cookies(cookies)
             else:
-                context = browser.new_context()
+                print(f"[COOKIE] No cookies for {domain}")
 
             page = context.new_page()
 
+            # Open site root (Cloudflare check happens here)
+            page.goto(base_url, wait_until="domcontentloaded", timeout=20000)
+
+            # Fetch image
             response = page.request.get(
                 url,
                 headers={
-                    "Referer": "https://comix.to/",
-                    "Origin": "https://comix.to"
+                    "Referer": base_url,
+                    "Origin": base_url,
                 },
-                timeout=15000
+                timeout=20000
             )
+
+            # If Cloudflare triggered, update cookies
+            new_cookies = context.cookies()
+
+            if new_cookies:
+                save_cookies(domain, new_cookies)
+                print(f"[COOKIE] Updated cookies for {domain}")
 
             body = response.body()
             status = response.status
@@ -110,22 +108,5 @@ def proxy():
         return str(e), 500
 
 
-def start_cookie_worker():
-    thread = threading.Thread(target=refresh_cookies, daemon=True)
-    thread.start()
-
-
 if __name__ == "__main__":
-
-    print("Starting cookie worker...")
-    start_cookie_worker()
-
-    print("Server running on http://localhost:5000")
-
-    app.run(
-        host="0.0.0.0",
-        port=5000,
-        debug=False,
-        threaded=True,
-        use_reloader=False
-    )
+    app.run(host="0.0.0.0", port=5000)
