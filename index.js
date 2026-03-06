@@ -5,17 +5,18 @@ import { chromium } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-let browser = null;
-let context = null;
-let page = null;
+let browser;
+let context;
+let page;
+
 let cookiesCache = null;
 let lastTokenTime = 0;
-let isRefreshing = false;
+let refreshPromise = null;
 
 const TOKEN_TTL = 10 * 60 * 1000; // 10 minutes
 
 /* =========================
-   SAFE BROWSER INIT
+   BROWSER INIT
 ========================= */
 
 async function initBrowser() {
@@ -25,17 +26,20 @@ async function initBrowser() {
 
   browser = await chromium.launch({
     headless: true,
-    executablePath: chromium.executablePath(), // critical for Render
+    executablePath: chromium.executablePath(),
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage"
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--single-process"
     ]
   });
 
   context = await browser.newContext({
     userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    viewport: { width: 1280, height: 800 }
   });
 
   page = await context.newPage();
@@ -50,38 +54,57 @@ async function initBrowser() {
 }
 
 /* =========================
-   REFRESH CLOUDFLARE COOKIE
+   COOKIE REFRESH
 ========================= */
 
 async function refreshCookies(targetUrl) {
-  if (isRefreshing) return;
-  isRefreshing = true;
+  if (refreshPromise) return refreshPromise;
 
-  try {
-    await initBrowser();
+  refreshPromise = (async () => {
+    try {
+      await initBrowser();
 
-    console.log("Refreshing Cloudflare token...");
+      const domain = new URL(targetUrl).origin;
 
-    await page.goto(targetUrl, {
-      waitUntil: "networkidle",
-      timeout: 60000
-    });
+      console.log("Refreshing Cloudflare token for:", domain);
 
-    await page.waitForTimeout(5000);
+      await page.goto(domain, {
+        waitUntil: "domcontentloaded",
+        timeout: 45000
+      });
 
-    cookiesCache = await context.cookies();
-    lastTokenTime = Date.now();
+      // allow CF JS challenge to finish
+      await page.waitForTimeout(7000);
 
-    console.log("Cookies refreshed.");
-  } catch (err) {
-    console.error("Cookie refresh failed:", err.message);
-  }
+      cookiesCache = await context.cookies();
+      lastTokenTime = Date.now();
 
-  isRefreshing = false;
+      console.log("Cloudflare cookies updated");
+    } catch (err) {
+      console.error("Cookie refresh failed:", err.message);
+      cookiesCache = null;
+    } finally {
+      refreshPromise = null;
+    }
+  })();
+
+  return refreshPromise;
 }
 
 /* =========================
-   FETCH WITH COOKIE
+   BUILD COOKIE HEADER
+========================= */
+
+function buildCookieHeader() {
+  if (!cookiesCache) return "";
+
+  return cookiesCache
+    .map(cookie => `${cookie.name}=${cookie.value}`)
+    .join("; ");
+}
+
+/* =========================
+   FETCH RESOURCE
 ========================= */
 
 async function fetchWithCookies(url) {
@@ -89,18 +112,17 @@ async function fetchWithCookies(url) {
     await refreshCookies(url);
   }
 
-  const cookieHeader = cookiesCache
-    ? cookiesCache.map(c => `${c.name}=${c.value}`).join("; ")
-    : "";
+  const headers = {
+    Cookie: buildCookieHeader(),
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    Referer: new URL(url).origin
+  };
 
   try {
-    const response = await axios.get(url, {
-      headers: {
-        Cookie: cookieHeader,
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-        Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
-      },
+    let response = await axios.get(url, {
+      headers,
       responseType: "arraybuffer",
       timeout: 20000,
       validateStatus: () => true
@@ -110,21 +132,21 @@ async function fetchWithCookies(url) {
       return response;
     }
 
-    console.log("Image request blocked. Retrying with new token...");
+    console.log("Blocked (", response.status, ") retrying with new cookies");
 
     await refreshCookies(url);
 
-    return await axios.get(url, {
-      headers: {
-        Cookie: cookiesCache.map(c => `${c.name}=${c.value}`).join("; "),
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
-      },
-      responseType: "arraybuffer"
+    headers.Cookie = buildCookieHeader();
+
+    response = await axios.get(url, {
+      headers,
+      responseType: "arraybuffer",
+      timeout: 20000
     });
 
+    return response;
   } catch (err) {
-    console.error("Final fetch failed:", err.message);
+    console.error("Fetch failed:", err.message);
     throw err;
   }
 }
@@ -139,15 +161,21 @@ app.get("/health", (req, res) => {
 
 app.get("/fetch", async (req, res) => {
   const { url } = req.query;
-  if (!url) return res.status(400).send("Missing url parameter");
+
+  if (!url) {
+    return res.status(400).send("Missing url parameter");
+  }
 
   try {
     const response = await fetchWithCookies(url);
 
-    res.set("Content-Type", response.headers["content-type"] || "image/jpeg");
-    res.send(response.data);
+    res.set(
+      "Content-Type",
+      response.headers["content-type"] || "image/jpeg"
+    );
 
-  } catch (err) {
+    res.send(response.data);
+  } catch {
     res.status(500).send("Failed to fetch resource");
   }
 });
