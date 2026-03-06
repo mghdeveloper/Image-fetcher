@@ -1,11 +1,11 @@
-# Use official Python 3.12 slim image
-FROM python:3.12-slim
+FROM python:3.11-slim
 
-# Install dependencies for Playwright and Chromium
+WORKDIR /app
+
+# Install system deps for Chromium
 RUN apt-get update && apt-get install -y \
-    curl \
     wget \
-    gnupg \
+    curl \
     ca-certificates \
     fonts-liberation \
     libnss3 \
@@ -21,33 +21,24 @@ RUN apt-get update && apt-get install -y \
     libpango-1.0-0 \
     libpangocairo-1.0-0 \
     libasound2 \
-    libatk-bridge2.0-0 \
     libgtk-3-0 \
     libxshmfence1 \
-    lsb-release \
-    xdg-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
-WORKDIR /app
-
-# Copy requirements file and install Python dependencies
+# Install python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browsers
-RUN python -m playwright install --with-deps
+# Install playwright browsers
+RUN playwright install --with-deps chromium
 
-# Copy app code
+# Copy app
 COPY . .
 
-# Expose port (Render default is 10000, can also be 5000)
+# Render uses PORT env variable
+ENV PORT=10000
+
 EXPOSE 10000
 
-# Set environment variables for Render
-ENV PYTHONUNBUFFERED=1 \
-    FLASK_RUN_HOST=0.0.0.0 \
-    FLASK_RUN_PORT=10000
-
-# Run Flask app
-CMD ["flask", "run"]
+# Start server automatically
+CMD ["gunicorn", "-b", "0.0.0.0:10000", "app:app"]
