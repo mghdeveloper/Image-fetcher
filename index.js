@@ -1,5 +1,4 @@
 import express from "express";
-import axios from "axios";
 import { chromium } from "playwright";
 
 const app = express();
@@ -9,14 +8,13 @@ let browser;
 let context;
 let page;
 
-let cookiesCache = null;
 let lastTokenTime = 0;
 let refreshPromise = null;
 
-const TOKEN_TTL = 10 * 60 * 1000; // 10 minutes
+const TOKEN_TTL = 10 * 60 * 1000;
 
 /* =========================
-   BROWSER INIT
+   INIT BROWSER
 ========================= */
 
 async function initBrowser() {
@@ -49,104 +47,71 @@ async function initBrowser() {
     browser = null;
     context = null;
     page = null;
-    cookiesCache = null;
   });
 }
 
 /* =========================
-   COOKIE REFRESH
+   SOLVE CLOUDFLARE
 ========================= */
 
-async function refreshCookies(targetUrl) {
+async function solveCloudflare(url) {
   if (refreshPromise) return refreshPromise;
 
   refreshPromise = (async () => {
-    try {
-      await initBrowser();
+    await initBrowser();
 
-      const domain = new URL(targetUrl).origin;
+    const domain = new URL(url).origin;
 
-      console.log("Refreshing Cloudflare token for:", domain);
+    console.log("Solving Cloudflare:", domain);
 
-      await page.goto(domain, {
-        waitUntil: "domcontentloaded",
-        timeout: 45000
-      });
+    await page.goto(domain, {
+      waitUntil: "domcontentloaded",
+      timeout: 45000
+    });
 
-      // allow CF JS challenge to finish
-      await page.waitForTimeout(7000);
+    await page.waitForTimeout(7000);
 
-      cookiesCache = await context.cookies();
-      lastTokenTime = Date.now();
+    lastTokenTime = Date.now();
 
-      console.log("Cloudflare cookies updated");
-    } catch (err) {
-      console.error("Cookie refresh failed:", err.message);
-      cookiesCache = null;
-    } finally {
-      refreshPromise = null;
-    }
+    console.log("Cloudflare solved");
   })();
 
-  return refreshPromise;
+  await refreshPromise;
+  refreshPromise = null;
 }
 
 /* =========================
-   BUILD COOKIE HEADER
+   FETCH IMAGE (BROWSER)
 ========================= */
 
-function buildCookieHeader() {
-  if (!cookiesCache) return "";
-
-  return cookiesCache
-    .map(cookie => `${cookie.name}=${cookie.value}`)
-    .join("; ");
-}
-
-/* =========================
-   FETCH RESOURCE
-========================= */
-
-async function fetchWithCookies(url) {
-  if (!cookiesCache || Date.now() - lastTokenTime > TOKEN_TTL) {
-    await refreshCookies(url);
+async function fetchImage(url) {
+  if (!browser || Date.now() - lastTokenTime > TOKEN_TTL) {
+    await solveCloudflare(url);
   }
 
-  const headers = {
-    Cookie: buildCookieHeader(),
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-    Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-    Referer: new URL(url).origin
-  };
-
   try {
-    let response = await axios.get(url, {
-      headers,
-      responseType: "arraybuffer",
-      timeout: 20000,
-      validateStatus: () => true
-    });
+    const response = await page.request.get(url);
 
-    if (response.status === 200) {
-      return response;
+    if (response.status() === 200) {
+      const buffer = await response.body();
+      return {
+        data: buffer,
+        type: response.headers()["content-type"]
+      };
     }
 
-    console.log("Blocked (", response.status, ") retrying with new cookies");
+    console.log("Blocked. Re-solving Cloudflare...");
 
-    await refreshCookies(url);
+    await solveCloudflare(url);
 
-    headers.Cookie = buildCookieHeader();
+    const retry = await page.request.get(url);
 
-    response = await axios.get(url, {
-      headers,
-      responseType: "arraybuffer",
-      timeout: 20000
-    });
-
-    return response;
+    return {
+      data: await retry.body(),
+      type: retry.headers()["content-type"]
+    };
   } catch (err) {
-    console.error("Fetch failed:", err.message);
+    console.error("Image fetch failed:", err.message);
     throw err;
   }
 }
@@ -167,14 +132,10 @@ app.get("/fetch", async (req, res) => {
   }
 
   try {
-    const response = await fetchWithCookies(url);
+    const result = await fetchImage(url);
 
-    res.set(
-      "Content-Type",
-      response.headers["content-type"] || "image/jpeg"
-    );
-
-    res.send(response.data);
+    res.set("Content-Type", result.type || "image/jpeg");
+    res.send(result.data);
   } catch {
     res.status(500).send("Failed to fetch resource");
   }
