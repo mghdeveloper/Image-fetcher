@@ -1,65 +1,84 @@
 from flask import Flask, request, Response
 from playwright.sync_api import sync_playwright
-import threading
-import time
-import os
+import requests
 
 app = Flask(__name__)
 
-COOKIE_FILE = "cookies.json"
-COOKIE_REFRESH_INTERVAL = 1800  # 30 minutes
+playwright = None
+browser = None
+context = None
+
+cookies = {}
+headers = {}
+
+session = requests.Session()
 
 
-def refresh_cookies():
-    while True:
-        try:
-            with sync_playwright() as p:
+def start_browser():
+    global playwright, browser, context
 
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-gpu",
-                        "--disable-blink-features=AutomationControlled",
-                    ]
-                )
+    playwright = sync_playwright().start()
 
-                context = browser.new_context()
+    browser = playwright.chromium.launch(headless=True)
 
-                page = context.new_page()
+    context = browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+    )
 
-                print("Refreshing cookies...")
+    print("✅ Playwright browser started")
 
-                page.goto(
-                    "https://comix.to/",
-                    wait_until="domcontentloaded",
-                    timeout=15000
-                )
-
-                context.storage_state(path=COOKIE_FILE)
-
-                browser.close()
-
-                print("Cookies updated")
-
-        except Exception as e:
-            print("Cookie refresh error:", e)
-
-        time.sleep(COOKIE_REFRESH_INTERVAL)
+    refresh_session()
 
 
-@app.route("/")
-def home():
-    return """
-    <html>
-    <body>
-        <h2>Playwright Headless Proxy</h2>
-        <p>Usage:</p>
-        <pre>/proxy?url=IMAGE_URL</pre>
-    </body>
-    </html>
-    """
+def refresh_session():
+    global cookies, headers
+
+    print("🔄 Refreshing cookies using Playwright...")
+
+    page = context.new_page()
+
+    page.goto("https://comix.to/", wait_until="domcontentloaded")
+
+    cookies_list = context.cookies()
+
+    cookies = {c["name"]: c["value"] for c in cookies_list}
+
+    headers = {
+        "User-Agent": page.evaluate("() => navigator.userAgent"),
+        "Referer": "https://comix.to/",
+        "Origin": "https://comix.to"
+    }
+
+    page.close()
+
+    print(f"✅ Session refreshed ({len(cookies)} cookies)")
+
+
+def fast_fetch(url):
+
+    print(f"⚡ Fast request: {url}")
+
+    try:
+        r = session.get(
+            url,
+            headers=headers,
+            cookies=cookies,
+            timeout=10
+        )
+
+        print(f"HTTP status: {r.status_code}")
+
+        if r.status_code == 200:
+            print("✅ Served via FAST HTTP request")
+            return r
+
+        print("⚠️ Fast request failed")
+
+        return None
+
+    except Exception as e:
+        print("❌ Fast request error:", e)
+        return None
 
 
 @app.route("/proxy")
@@ -68,64 +87,46 @@ def proxy():
     url = request.args.get("url")
 
     if not url:
-        return "Missing url parameter", 400
+        return "Missing url", 400
 
-    try:
-        with sync_playwright() as p:
+    print("\n==============================")
+    print("Incoming request:", url)
 
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                ]
-            )
+    # 1️⃣ try fast request
+    r = fast_fetch(url)
 
-            if os.path.exists(COOKIE_FILE):
-                context = browser.new_context(storage_state=COOKIE_FILE)
-            else:
-                context = browser.new_context()
+    if r:
+        return Response(
+            r.content,
+            status=r.status_code,
+            content_type=r.headers.get("content-type")
+        )
 
-            page = context.new_page()
+    # 2️⃣ fallback to browser refresh
+    print("🧠 Falling back to Playwright")
 
-            response = page.request.get(
-                url,
-                headers={
-                    "Referer": "https://comix.to/",
-                    "Origin": "https://comix.to"
-                },
-                timeout=15000
-            )
+    refresh_session()
 
-            body = response.body()
-            status = response.status
-            content_type = response.headers.get("content-type", "image/webp")
+    r = fast_fetch(url)
 
-            browser.close()
+    if r:
+        return Response(
+            r.content,
+            status=r.status_code,
+            content_type=r.headers.get("content-type")
+        )
 
-            return Response(body, status=status, content_type=content_type)
+    print("❌ Request failed after refresh")
 
-    except Exception as e:
-        return str(e), 500
-
-
-def start_cookie_worker():
-    thread = threading.Thread(target=refresh_cookies, daemon=True)
-    thread.start()
+    return "Failed", 500
 
 
 if __name__ == "__main__":
 
-    print("Starting cookie worker...")
-    start_cookie_worker()
-
-    print("Server running on http://localhost:5000")
+    start_browser()
 
     app.run(
         host="0.0.0.0",
         port=5000,
-        debug=False,
-        threaded=True,
-        use_reloader=False
+        threaded=True
     )
